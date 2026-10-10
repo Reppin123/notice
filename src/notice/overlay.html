@@ -25,11 +25,22 @@
   #caption { position:absolute; left:50%; bottom:28px; transform:translateX(-50%); padding:8px 16px; border-radius:12px;
     background:var(--bg); font-size:20px; opacity:0; transition:opacity .3s; max-width:70vw; text-align:center; }
   #caption s { color:var(--mute); }
+  #pov { position:absolute; right:16px; bottom:16px; width:min(40vw, 560px); border-radius:14px; overflow:hidden;
+    background:var(--bg); box-shadow:0 8px 30px rgba(0,0,0,.4); display:none; }
+  body.pov #pov { display:block; }
+  #pov img { display:block; width:100%; }
+  #pov .lbl { position:absolute; left:10px; top:8px; font-size:12px; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--accent); text-shadow:0 1px 3px #000; }
+  #pov .crop { position:absolute; right:10px; top:10px; width:30%; border:3px solid var(--accent); border-radius:10px;
+    opacity:0; transition:opacity .3s; }
+  #pov .cap { position:absolute; left:0; right:0; bottom:0; padding:8px 12px; background:linear-gradient(transparent, rgba(0,0,0,.8));
+    font-size:14px; opacity:0; transition:opacity .3s; }
 </style></head>
 <body>
 <div id="dot"></div><div id="ring"></div>
 <div id="pill"><i></i><span id="pilltext">Notice</span><span class="mem">● memory on</span></div>
 <div id="caption"></div>
+<div id="pov"><img id="povimg" alt=""><span class="lbl">What I see · eyes</span><img class="crop" id="povcrop" alt=""><div class="cap" id="povcap"></div></div>
 <script>
 const API = location.origin;
 const q = new URLSearchParams(location.search);
@@ -46,6 +57,20 @@ fetch(API + '/layout').then(r => r.json()).then(L => {
     document.body.appendChild(img);
   }
 });
+
+// first-person view: the scene camera with the gaze circle (judges see what the wearer sees)
+async function pov() {
+  try {
+    const r = await fetch(API + '/frame?max_w=720');
+    if (r.ok) {
+      const u = URL.createObjectURL(await r.blob());
+      const im = $('povimg'), old = im.src; im.src = u; if (old) URL.revokeObjectURL(old);
+      document.body.classList.add('pov');
+    } else document.body.classList.remove('pov');
+  } catch (e) {}
+  setTimeout(pov, 100);
+}
+if (q.get('pov') !== '0') pov();
 
 // live gaze + addressing
 async function tick() {
@@ -117,6 +142,12 @@ function connect() {
       bubble(e.x, e.y, 'Apprentice', e.instruction || '', 4000);
     } else if (e.type === 'offer') {
       const b = bubble(e.x, e.y, e.kind || 'help', e.text, e.ms || 8000); b.classList.add('offer');
+    } else if (e.type === 'window' && e.items && e.items.length) {
+      const w = e.items.find(i => i.kind === 'world') || e.items[0];
+      if (w.image) { $('povcrop').src = API + '/crop?path=' + encodeURIComponent(w.image); $('povcrop').style.opacity = 1; }
+      $('povcap').textContent = w.caption || (w.elements && w.elements[0] ? w.elements[0].label : '');
+      $('povcap').style.opacity = 1;
+      setTimeout(() => { $('povcrop').style.opacity = 0; $('povcap').style.opacity = 0; }, 6000);
     } else if (e.type === 'recall' && e.hits) {
       caption(esc(e.answer || ''), 8000);
     }

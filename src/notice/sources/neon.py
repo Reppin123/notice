@@ -24,14 +24,13 @@ log = logging.getLogger("notice.neon")
 
 
 class NeonGaze:
-    def __init__(self, state: AttentionState, ip: str | None = None, emit=None, scene_hz: float = 15):
-        self.state, self.ip, self.emit = state, ip, emit or (lambda *a, **k: None)
+    def __init__(self, state: AttentionState, scene, ip: str | None = None, emit=None, scene_hz: float = 15):
+        self.state, self.scene, self.ip, self.emit = state, scene, ip, emit or (lambda *a, **k: None)
         self.offset_s = 0.0
         self.scene_period = 1.0 / scene_hz
         self.mapper: GazeMapper | None = None
         self.surface = None
         self.screen_seen_at = 0.0  # last time the tags were located
-        self.latest_frame = None  # (mac_t, bgr) for world-mode crops
         self.stats = {"gaze": 0, "fixations": 0, "blinks": 0, "frames": 0}
 
     async def _device(self) -> Device:
@@ -89,21 +88,22 @@ class NeonGaze:
                 continue
             last = now
             bgr = frame.bgr_buffer()
-            self.latest_frame = (frame.timestamp_unix_seconds + self.offset_s, bgr)
-            await asyncio.to_thread(self.mapper.process_scene, bgr)
+            t = frame.timestamp_unix_seconds + self.offset_s
+            await asyncio.to_thread(self._process, t, bgr)
             loc = self.mapper._surface_locations.get(self.surface.uid)
             if loc is not None:
                 self.screen_seen_at = now
             self.stats["frames"] += 1
 
+    def _process(self, t, bgr):
+        self.scene.add(t, bgr)
+        self.mapper.process_scene(bgr)
+
     async def _gaze(self, url):
         async for g in receive_gaze_data(url, run_loop=True):
             t = g.timestamp_unix_seconds + self.offset_s
             x, y = self.to_screen(g.x, g.y)
-            self.state.add_gaze(GazePoint(t, x, y, g.worn))
-            self.state.last_scene_gaze = (t, g.x, g.y)
-            if hasattr(g, "pupil_diameter_left"):
-                self.state.last_pupil = (t, (g.pupil_diameter_left + g.pupil_diameter_right) / 2)
+            self.state.add_gaze(GazePoint(t, x, y, g.worn, g.x, g.y))
             self.stats["gaze"] += 1
 
     async def _events(self, url):

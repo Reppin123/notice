@@ -20,7 +20,9 @@ def mouse_pos() -> tuple[float, float]:
 
 
 class MouseGaze:
-    def __init__(self, state: AttentionState, hz: float = 120, offset_px: float = 35.0, jitter_px: float = 2.0, recorder=None):
+    def __init__(self, state: AttentionState, hz: float = 120, offset_px: float = 35.0, jitter_px: float = 2.0, recorder=None, world_size=None):
+        """world_size=(w, h): treat the mouse as gaze INTO the scene camera frame (webcam stand-in)."""
+        self.world_size = world_size
         self.state = state
         self.hz = hz
         self.offset_px, self.jitter_px = offset_px, jitter_px
@@ -47,7 +49,13 @@ class MouseGaze:
                 for i in range(2):  # mean-reverting random walk, sd ~ offset_px
                     self.off[i] += -0.0005 * self.off[i] + random.gauss(0, self.offset_px * 0.032)
                 j = self.jitter_px
-                g = GazePoint(t, x + self.off[0] + random.gauss(0, j), y + self.off[1] + random.gauss(0, j))
+                gx, gy = x + self.off[0] + random.gauss(0, j), y + self.off[1] + random.gauss(0, j)
+                if self.world_size:
+                    from .markers import screen_size
+                    W, H = screen_size()
+                    g = GazePoint(t, None, None, True, gx / W * self.world_size[0], gy / H * self.world_size[1])
+                else:
+                    g = GazePoint(t, gx, gy)
             self.state.add_gaze(g)
             self.detector.feed(g)
             if self.recorder:

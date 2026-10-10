@@ -37,6 +37,8 @@ class GazePoint:
     x: float | None
     y: float | None
     worn: bool = True
+    sx: float | None = None  # scene-camera px (world)
+    sy: float | None = None
 
 
 @dataclass
@@ -102,10 +104,15 @@ class IDTDetector:
         self.min_duration = min_duration
         self.window: list[GazePoint] = []
         self.current: Fixation | None = None
+        self.scene_of = None  # optional fn(GazePoint) -> (sx, sy) for world-mode sims
+
+    @staticmethod
+    def _xy(p):
+        return (p.x, p.y) if p.x is not None else (p.sx, p.sy)
 
     def _dispersion(self, pts) -> float:
-        xs = [p.x for p in pts]
-        ys = [p.y for p in pts]
+        xs = [self._xy(p)[0] for p in pts]
+        ys = [self._xy(p)[1] for p in pts]
         return (max(xs) - min(xs)) + (max(ys) - min(ys))
 
     def _update(self):
@@ -113,19 +120,25 @@ class IDTDetector:
         if not w or w[-1].t - w[0].t < self.min_duration:
             return
         n = len(w)
-        x, y = sum(p.x for p in w) / n, sum(p.y for p in w) / n
+        x = y = None
+        if w[-1].x is not None:
+            x, y = sum(p.x for p in w) / n, sum(p.y for p in w) / n
+        sx = sy = None
+        if w[-1].sx is not None:
+            sx, sy = sum(p.sx for p in w) / n, sum(p.sy for p in w) / n
         if self.current is None:
-            self.current = Fixation(w[0].t, w[-1].t, x, y)
+            self.current = Fixation(w[0].t, w[-1].t, x, y, sx, sy)
             self.on_fixation(self.current)
         else:
-            self.current.end, self.current.x, self.current.y = w[-1].t, x, y
+            c = self.current
+            c.end, c.x, c.y, c.scene_x, c.scene_y = w[-1].t, x, y, sx, sy
 
     def _flush(self):
         self._update()
         self.window, self.current = [], None
 
     def feed(self, g: GazePoint) -> None:
-        if g.x is None:
+        if g.x is None and g.sx is None:
             self._flush()
             return
         self.window.append(g)

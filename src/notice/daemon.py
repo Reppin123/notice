@@ -40,8 +40,9 @@ def fmt_target(r: dict) -> str:
 
 
 class Notice:
-    def __init__(self, state: AttentionState, apprentice=None, dry_run=False):
+    def __init__(self, state: AttentionState, apprentice=None, dry_run=False, scene=None, memory=None):
         self.state = state
+        self.scene, self.memory = scene, memory
         self.apprentice = apprentice
         self.dry_run = dry_run
         self.events: deque = deque(maxlen=200)
@@ -177,6 +178,47 @@ def make_app(n: Notice) -> web.Application:
             markers.marker_png(i, str(p), side=markers.SIZE * 2)
         return web.FileResponse(p)
 
+    async def window_(req):
+        """Glasses context for one utterance. start/end = Mac epoch seconds."""
+        from . import window
+        end = float(req.query.get("end", time.time()))
+        start = float(req.query.get("start", end - 3.0))
+        out = await asyncio.to_thread(window.build, n.state, n.memory, start, end)
+        n.emit("window", note=out["note"], items=out["items"], build_ms=out["build_ms"])
+        return j(out)
+
+    async def frame(req):
+        """Latest scene frame with the gaze circle (what the wearer sees right now), JPEG."""
+        from .scene import decode, mark_gaze
+        import cv2
+        fr = n.scene.latest() if n.scene else None
+        if fr is None:
+            return web.Response(status=404, text="no scene frame")
+        g = next((g for g in reversed(n.state.gaze) if g.sx is not None), None)
+        img = decode(fr[1])
+        if g:
+            img = mark_gaze(img, g.sx, g.sy, max_w=int(req.query.get("max_w", 1024)))
+        ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return web.Response(body=jpg.tobytes(), content_type="image/jpeg",
+                            headers={"X-Frame-Age-Ms": str(round((time.time() - fr[0]) * 1000))})
+
+    async def recall(req):
+        if not n.memory:
+            return j([])
+        since = req.query.get("since")
+        return j(await asyncio.to_thread(n.memory.recall, req.query.get("q", ""), float(since) if since else None))
+
+    async def crop(req):  # only files inside Notice's own crops folder
+        from .memory import DATA
+        p = Path(req.query.get("path", "")).resolve()
+        if (DATA / "crops").resolve() not in p.parents or not p.exists():
+            return web.Response(status=404)
+        return web.FileResponse(p)
+
+    app.router.add_get("/crop", crop)
+    app.router.add_get("/window", window_)
+    app.router.add_get("/frame", frame)
+    app.router.add_get("/recall", recall)
     app.router.add_get("/", overlay)
     app.router.add_get("/gaze", gaze)
     app.router.add_get("/layout", layout)
@@ -190,22 +232,49 @@ def make_app(n: Notice) -> web.Application:
     return app
 
 
+async def memory_writer(state: AttentionState, memory):
+    """Store every world fixation that reaches 300 ms (crop + async caption)."""
+    done: set[int] = set()
+    while True:
+        await asyncio.sleep(0.2)
+        with state.lock:
+            recent = [f for f in list(state.fixations)[-10:] if id(f) not in done and f.scene_x is not None
+                      and f.x is None and f.duration >= 0.3]
+        for f in recent:
+            done.add(id(f))
+            await asyncio.to_thread(memory.on_fixation, f)
+
+
 async def amain(args):
     from .apprentice import Apprentice
 
+    from .memory import AttentionMemory
+    from .scene import SceneBuffer, WebcamScene
+
     state = AttentionState()
-    n = Notice(state, dry_run=args.dry_run)
+    scene = SceneBuffer()
+    memory = AttentionMemory(scene, enabled=not args.no_memory)
+    n = Notice(state, dry_run=args.dry_run, scene=scene, memory=memory)
+    n.memory_on = memory.enabled
     src = args.gaze
-    if src == "mouse":
+    if src in ("mouse", "mouse-world"):
         from .sources.mouse import MouseGaze
         from .sources.replay import GazeRecorder
-        MouseGaze(state, recorder=GazeRecorder(args.record) if args.record else None).start()
+        world = None
+        if src == "mouse-world":  # webcam (or --scene file) = scene camera, mouse = gaze into it
+            from .scene import FileScene
+            cam = FileScene(scene, args.scene).start() if args.scene else WebcamScene(scene).start()
+            while cam.size is None:
+                await asyncio.sleep(0.1)
+            world = cam.size
+        MouseGaze(state, recorder=GazeRecorder(args.record) if args.record else None, world_size=world).start()
     elif src.startswith("replay:"):
         from .sources.replay import ReplayGaze
         ReplayGaze(state, src.split(":", 1)[1], loop=True).start()
     elif src == "neon":
         from .sources.neon import NeonGaze
-        asyncio.create_task(NeonGaze(state, ip=args.neon_ip, emit=n.emit).run())
+        asyncio.create_task(NeonGaze(state, scene, ip=args.neon_ip, emit=n.emit).run())
+    asyncio.create_task(memory_writer(state, memory))
 
     if not args.dry_run:
         n.apprentice = Apprentice(on_event=n.on_apprentice)
@@ -236,12 +305,14 @@ async def amain(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="notice")
-    ap.add_argument("--gaze", default="mouse", help="mouse | replay:<file.jsonl> | neon")
+    ap.add_argument("--gaze", default="mouse", help="mouse | mouse-world (webcam as scene cam) | replay:<file.jsonl> | neon")
     ap.add_argument("--neon-ip")
     ap.add_argument("--record", help="append raw gaze to this JSONL (mouse mode)")
     ap.add_argument("--no-mic", action="store_true", help="no STT; drive with POST /say")
     ap.add_argument("--dry-run", action="store_true", help="resolve but don't send to Apprentice")
     ap.add_argument("--no-overlay", action="store_true")
+    ap.add_argument("--scene", help="mouse-world: image/video file as the scene camera instead of the webcam")
+    ap.add_argument("--no-memory", action="store_true", help="don't store fixated crops")
     ap.add_argument("--tags", action="store_true", help="show AprilTags even without Neon")
     ap.add_argument("--debug", action="store_true", help="show the gaze dot")
     args = ap.parse_args()
