@@ -49,6 +49,8 @@ class Notice:
         self.listeners: set[asyncio.Queue] = set()
         self.last_resolution: list[dict] = []
         self.memory_on = False
+        self.neon = None
+        self.source = ""
 
     def emit(self, kind: str, **data):
         ev = {"type": kind, "t": time.time(), **data}
@@ -195,8 +197,8 @@ def make_app(n: Notice) -> web.Application:
         from .scene import decode, mark_gaze
         import cv2
         fr = n.scene.latest() if n.scene else None
-        if fr is None:
-            return web.Response(status=404, text="no scene frame")
+        if fr is None or time.time() - fr[0] > 1.5:
+            return web.Response(status=404, text="no fresh scene frame (glasses not streaming)")
         g = next((g for g in reversed(n.state.gaze) if g.sx is not None), None)
         img = decode(fr[1])
         if g:
@@ -204,6 +206,28 @@ def make_app(n: Notice) -> web.Application:
         ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
         return web.Response(body=jpg.tobytes(), content_type="image/jpeg",
                             headers={"X-Frame-Age-Ms": str(round((time.time() - fr[0]) * 1000))})
+
+    async def health(_):
+        """Everything the preflight checks: is each link alive and fresh?"""
+        now = time.time()
+        with n.state.lock:
+            g2 = [g for g in n.state.gaze if g.t >= now - 2]
+            fx10 = [f for f in n.state.fixations if f.end >= now - 10]
+        fr = n.scene.latest() if n.scene else None
+        last = n.state.last_gaze()
+        out = {"source": n.source,
+               "gaze_hz": round(len(g2) / 2, 1),
+               "gaze_age_s": round(now - last.t, 2) if last else None,
+               "on_screen_fraction": round(n.state.on_screen_fraction(1.0), 2),
+               "fixations_10s": len(fx10),
+               "frame_age_s": round(now - fr[0], 2) if fr else None,
+               "frame_size": list(fr[2]) if fr else None,
+               "memory": {"armed": n.memory.armed, **n.memory.stats} if n.memory else None,
+               "recording": bool(getattr(n, "recorder", None) and n.recorder.active)}
+        if n.neon:
+            out["neon"] = {**n.neon.status, **n.neon.stats,
+                           "screen_tags_age_s": round(now - n.neon.screen_seen_at, 1) if n.neon.screen_seen_at else None}
+        return j(out)
 
     async def capture(req):
         """Apprentice arms capture while the user is on a call (on=1, renewed each turn) and disarms at hang-up."""
@@ -231,6 +255,7 @@ def make_app(n: Notice) -> web.Application:
         return web.FileResponse(p)
 
     app.router.add_get("/crop", crop)
+    app.router.add_get("/health", health)
     app.router.add_post("/capture", capture)
     app.router.add_get("/capture", capture)
     app.router.add_post("/forget", forget)
@@ -289,6 +314,7 @@ async def amain(args):
     n = Notice(state, dry_run=args.dry_run, scene=scene, memory=memory)
     n.memory_on = memory.enabled
     src = args.gaze
+    n.source = src
     if src in ("mouse", "mouse-world"):
         from .sources.mouse import MouseGaze
         from .sources.replay import GazeRecorder
@@ -300,13 +326,21 @@ async def amain(args):
                 await asyncio.sleep(0.1)
             world = cam.size
         MouseGaze(state, recorder=GazeRecorder(args.record) if args.record else None, world_size=world).start()
+    elif src.startswith("session:"):
+        from .recorder import SessionReplay
+        SessionReplay(state, scene, src.split(":", 1)[1]).start()
     elif src.startswith("replay:"):
         from .sources.replay import ReplayGaze
         ReplayGaze(state, src.split(":", 1)[1], loop=True).start()
     elif src == "neon":
         from .sources.neon import NeonGaze
-        asyncio.create_task(NeonGaze(state, scene, ip=args.neon_ip, emit=n.emit).run())
+        n.neon = NeonGaze(state, scene, ip=args.neon_ip, emit=n.emit)
+        asyncio.create_task(n.neon.run())
     asyncio.create_task(memory_writer(state, memory))
+    if args.record_sessions:
+        from .recorder import Recorder
+        n.recorder = Recorder(state, scene, memory)
+        asyncio.create_task(n.recorder.run())
     from .voice import Voice
     n.voice = Voice(args.voice)
 
@@ -339,13 +373,15 @@ async def amain(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="notice")
-    ap.add_argument("--gaze", default="mouse", help="mouse | mouse-world (webcam as scene cam) | replay:<file.jsonl> | neon")
+    ap.add_argument("--gaze", default="mouse", help="mouse | mouse-world | neon | session:<dir> | replay:<file.jsonl>")
     ap.add_argument("--neon-ip")
     ap.add_argument("--record", help="append raw gaze to this JSONL (mouse mode)")
     ap.add_argument("--no-mic", action="store_true", help="no STT; drive with POST /say")
     ap.add_argument("--dry-run", action="store_true", help="resolve but don't send to Apprentice")
     ap.add_argument("--no-overlay", action="store_true")
     ap.add_argument("--scene", help="mouse-world: image/video file as the scene camera instead of the webcam")
+    ap.add_argument("--record-sessions", action="store_true",
+                    help="while armed (on a call) also save raw gaze + 2 fps frames for replay (may include people)")
     ap.add_argument("--capture-always", action="store_true", help="dev: save crops without a call arming it")
     ap.add_argument("--no-memory", action="store_true", help="don't store fixated crops")
     ap.add_argument("--tags", action="store_true", help="show AprilTags even without Neon")

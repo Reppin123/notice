@@ -44,7 +44,7 @@ class AttentionMemory:
         self.db = sqlite3.connect(DATA / "memory.db", check_same_thread=False)
         self.db.execute("""create table if not exists seen(
             id integer primary key, t real, dwell_ms int, scene_x real, scene_y real,
-            crop text, hash text, caption text)""")
+            crop text, hash text, caption text, codes text default '', labels text default '')""")
         self.db.execute("create virtual table if not exists seen_fts using fts5(caption, content='seen', content_rowid='id')")
         self.lock = threading.Lock()
         self.recent: list[tuple[float, int, int, float]] = []  # (t, hash, row id, fixation start)
@@ -56,7 +56,7 @@ class AttentionMemory:
     def _warm(self):  # Vision loads its models on first use (~4 s)
         import numpy as np
         try:
-            ocr.read(np.full((64, 64, 3), 255, np.uint8))
+            ocr.analyze(np.full((64, 64, 3), 255, np.uint8))
         except Exception as e:
             log.warning("OCR warm-up failed: %s", e)
 
@@ -91,7 +91,8 @@ class AttentionMemory:
         fr = self.scene.nearest((f.start + f.end) / 2)
         if fr is None:
             return None
-        crop = crop_around(decode(fr[1]), f.scene_x, f.scene_y)
+        full = decode(fr[1])
+        crop = crop_around(full, f.scene_x, f.scene_y)
         h = dhash(crop)
         self.recent = [r for r in self.recent if now - r[0] < DEDUPE_S]
         for _, oh, rid, _ in self.recent:
@@ -102,19 +103,24 @@ class AttentionMemory:
                 self.stats["dupe"] += 1
                 return rid
         t0 = time.time()
-        text, face = ocr.read(crop)
+        a = ocr.analyze(crop)
+        text, face = a["text"], a["face"]
         if face > FACE_MAX:
             self.stats["face"] += 1
             log.info("skipped a crop with a face (%.0f%%)", face * 100)
             return None
+        found = a["codes"] or ocr.codes(crop_around(full, f.scene_x, f.scene_y, size=800))
+        codes, labels = " ".join(found), ", ".join(a["labels"])
         path = DATA / "crops" / f"{int(now * 1000)}.jpg"
         cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
         with self.lock:
-            cur = self.db.execute("insert into seen(t, dwell_ms, scene_x, scene_y, crop, hash, caption) values(?,?,?,?,?,?,?)",
-                                  (f.start, dwell, f.scene_x, f.scene_y, str(path), str(h), text))
+            cur = self.db.execute("insert into seen(t, dwell_ms, scene_x, scene_y, crop, hash, caption, codes, labels) "
+                                  "values(?,?,?,?,?,?,?,?,?)",
+                                  (f.start, dwell, f.scene_x, f.scene_y, str(path), str(h), text, codes, labels))
             rid = cur.lastrowid
-            if text:
-                self.db.execute("insert into seen_fts(rowid, caption) values(?, ?)", (rid, text))
+            searchable = " ".join(x for x in (text, labels, codes) if x)
+            if searchable:
+                self.db.execute("insert into seen_fts(rowid, caption) values(?, ?)", (rid, searchable))
             self.db.commit()
         self.recent.append((now, h, rid, f.start))
         self.saved_at.append(now)
@@ -149,8 +155,8 @@ class AttentionMemory:
     # ---- read --------------------------------------------------------------------------
     def get(self, rid: int, wait_s: float = 0.0) -> dict | None:
         with self.lock:
-            row = self.db.execute("select id, t, dwell_ms, crop, caption from seen where id = ?", (rid,)).fetchone()
-        return dict(zip(("id", "t", "dwell_ms", "crop", "caption"), row)) if row else None
+            row = self.db.execute("select id, t, dwell_ms, crop, caption, codes, labels from seen where id = ?", (rid,)).fetchone()
+        return dict(zip(("id", "t", "dwell_ms", "crop", "caption", "codes", "labels"), row)) if row else None
 
     def recall(self, query: str = "", since: float | None = None, limit: int = 5) -> list[dict]:
         since = since or 0
@@ -158,15 +164,15 @@ class AttentionMemory:
             if query.strip():
                 q = " OR ".join(json.dumps(w) for w in query.split() if len(w) > 2) or json.dumps(query)
                 rows = self.db.execute(
-                    "select s.id, s.t, s.dwell_ms, s.crop, s.caption, bm25(seen_fts) from seen_fts "
+                    "select s.id, s.t, s.dwell_ms, s.crop, s.caption, bm25(seen_fts), s.codes, s.labels from seen_fts "
                     "join seen s on s.id = seen_fts.rowid where seen_fts match ? and s.t >= ? limit 50", (q, since)).fetchall()
                 if not rows:  # text-less things (a bottle): fall back to recent, the model can look
-                    rows = self.db.execute("select id, t, dwell_ms, crop, caption, 0 from seen where t >= ? "
+                    rows = self.db.execute("select id, t, dwell_ms, crop, caption, 0, codes, labels from seen where t >= ? "
                                            "order by t desc limit 20", (since,)).fetchall()
             else:
-                rows = self.db.execute("select id, t, dwell_ms, crop, caption, 0 from seen where t >= ? "
+                rows = self.db.execute("select id, t, dwell_ms, crop, caption, 0, codes, labels from seen where t >= ? "
                                        "order by t desc limit 50", (since,)).fetchall()
         now = time.time()
         # bm25 is negative-better; dwell and recency push "the one I looked at longest" up
         scored = sorted(rows, key=lambda r: r[5] - r[2] / 2000 + (now - r[1]) / 3600)
-        return [dict(zip(("id", "t", "dwell_ms", "crop", "caption"), r[:5])) for r in scored[:limit]]
+        return [dict(zip(("id", "t", "dwell_ms", "crop", "caption", "codes", "labels"), r[:5] + r[6:8])) for r in scored[:limit]]

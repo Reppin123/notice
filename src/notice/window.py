@@ -12,6 +12,7 @@ from .core import AttentionState, Fixation
 
 LEAD_S, TAIL_S = 1.0, 0.3
 MIN_S = 0.15
+STALE_S = 1.5  # no gaze for this long = glasses not streaming
 
 
 def _current_world_fixation(state: AttentionState, end: float) -> Fixation | None:
@@ -59,6 +60,12 @@ THIN_TEXT = 15  # fewer characters than this = the picture is what matters
 
 def build(state: AttentionState, memory, start: float, end: float, words: str = "") -> dict:
     t0 = time.time()
+    g = state.last_gaze()
+    if g is None or t0 - g.t > STALE_S:
+        age = "never" if g is None else f"{t0 - g.t:.0f} s ago"
+        return {"items": [], "stale": True, "build_ms": 0,
+                "note": f"[Glasses: NOT streaming right now (last gaze {age}). You can't see what the user is "
+                        "looking at; if they ask about something in front of them, say so.]"}
     items, seen_rows = [], set()
     for f in targets(state, start, end):
         it = {"t": round(f.start - start, 2), "dwell_ms": round(f.duration * 1000)}
@@ -74,8 +81,9 @@ def build(state: AttentionState, memory, start: float, end: float, words: str = 
             seen_rows.add(row["id"])
             text = row.get("caption") or ""
             visual = bool(VISUAL & {w.strip(".,?!").lower() for w in words.split()})
-            it.update(kind="world", caption=text,
-                      image=row["crop"] if (len(text) < THIN_TEXT or visual) else None)
+            thin = len(text) < THIN_TEXT and not row.get("codes") and not row.get("labels")
+            it.update(kind="world", caption=text, codes=row.get("codes") or "", labels=row.get("labels") or "",
+                      image=row["crop"] if (thin or visual) else None)
         else:
             continue
         items.append(it)
@@ -93,6 +101,10 @@ def note(items: list[dict]) -> str:
             parts.append(f"{i}) on the Mac screen: {what}")
         else:
             txt = f'something with the text "{it["caption"]}"' if it["caption"] else "something with no readable text"
+            if it.get("labels"):
+                txt += f' (looks like: {it["labels"]})'
+            if it.get("codes"):
+                txt += f' (QR/barcode: {it["codes"]})'
             img = f" [picture: {it['image']}]" if it.get("image") else ""
             parts.append(f"{i}) in the room: {txt}{img}")
     return ("[Glasses: while speaking the user looked at, in order (" + str(len(items)) +

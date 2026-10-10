@@ -24,6 +24,7 @@ dependencies = [
 [project.scripts]
 notice = "notice.daemon:main"
 notice-mcp = "notice.mcp_server:main"
+notice-preflight = "notice.preflight:main"
 notice-voice = "notice.voice:main"
 
 [build-system]

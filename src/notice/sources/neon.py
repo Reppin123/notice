@@ -31,7 +31,9 @@ class NeonGaze:
         self.mapper: GazeMapper | None = None
         self.surface = None
         self.screen_seen_at = 0.0  # last time the tags were located
-        self.stats = {"gaze": 0, "fixations": 0, "blinks": 0, "frames": 0}
+        self.stats = {"gaze": 0, "fixations": 0, "blinks": 0, "frames": 0, "reconnects": 0}
+        self.status = {"connected": False, "device": None, "offset_ms": None, "roundtrip_ms": None, "error": None}
+        self.last_gaze_at = 0.0
 
     async def _device(self) -> Device:
         if self.ip:
@@ -46,6 +48,8 @@ class NeonGaze:
             est = await device.estimate_time_offset()
             if est:
                 self.offset_s = est.time_offset_ms.mean / 1000
+                self.status.update(offset_ms=round(est.time_offset_ms.mean, 1),
+                                   roundtrip_ms=round(est.roundtrip_duration_ms.mean, 1))
                 self.emit("neon_clock", offset_ms=round(est.time_offset_ms.mean, 1),
                           roundtrip_ms=round(est.roundtrip_duration_ms.mean, 1))
             await asyncio.sleep(60)
@@ -64,6 +68,29 @@ class NeonGaze:
         return hits[0].x * w, (1 - hits[0].y) * h
 
     async def run(self):
+        """Watchdog: (re)connect forever; a stream that errors or goes quiet for 3 s restarts everything."""
+        backoff = 1.0
+        while True:
+            try:
+                await self._run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.status.update(connected=False, error=f"{type(e).__name__}: {e}"[:200])
+                self.emit("neon_down", error=self.status["error"], retry_s=backoff)
+                log.warning("Neon down (%s); retry in %.0f s", e, backoff)
+            self.stats["reconnects"] += 1
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+
+    async def _stall_watch(self):
+        await asyncio.sleep(5)  # streams take a moment to start
+        while True:
+            await asyncio.sleep(1)
+            if time.time() - self.last_gaze_at > 3:
+                raise RuntimeError("no gaze for 3 s")
+
+    async def _run_once(self):
         device = await self._device()
         async with device:
             status = await device.get_status()
@@ -71,14 +98,23 @@ class NeonGaze:
             self.mapper = GazeMapper(calib)
             verts, size = markers.marker_verts()
             self.surface = self.mapper.add_surface(verts, size)
+            self.status.update(connected=True, device=status.phone.device_name, error=None)
             self.emit("neon_connected", name=status.phone.device_name, ip=status.phone.ip,
                       battery=status.phone.battery_level)
-            await asyncio.gather(
+            tasks = [asyncio.create_task(c) for c in (
                 self._offset_loop(device),
                 self._scene(status.direct_world_sensor().url),
                 self._gaze(status.direct_gaze_sensor().url),
                 self._events(status.direct_eye_events_sensor().url),
-            )
+                self._stall_watch())]
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    t.result()  # re-raise the first failure
+                raise RuntimeError("a Neon stream ended")
+            finally:
+                for t in tasks:
+                    t.cancel()
 
     async def _scene(self, url):
         last = 0.0
@@ -102,6 +138,7 @@ class NeonGaze:
     async def _gaze(self, url):
         async for g in receive_gaze_data(url, run_loop=True):
             t = g.timestamp_unix_seconds + self.offset_s
+            self.last_gaze_at = time.time()
             x, y = self.to_screen(g.x, g.y)
             self.state.add_gaze(GazePoint(t, x, y, g.worn, g.x, g.y))
             self.stats["gaze"] += 1

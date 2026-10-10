@@ -1,0 +1,7 @@
+15:54:30 notice.voice voice backend: eleven
+15:54:30 notice Attention API on http://127.0.0.1:8790
+15:54:35 notice capture {"on": true}
+15:54:36 notice.memory saved 1 in 362 ms: Closing Demos Sun 1:30 PM Main Stage
+15:54:36 notice.memory saved 2 in 65 ms: Demo Night Sat 7:00 PM Hall B
+15:54:37 notice window {"note": "[Glasses: while speaking the user looked at, in order (2); 'this/that/there' refer to these] 1) in the room: something with the text \"Closing Demos Sun 1:30 PM Main Stage\" \u00b7 2) in the room: something with the text \"Demo Night Sat 7:00 PM Hall B\"", "items": [{"t": -1.02, "dwell_ms"
+15:54:38 notice capture {"on": false}
