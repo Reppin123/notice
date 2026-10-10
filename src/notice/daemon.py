@@ -246,6 +246,14 @@ def make_app(n: Notice) -> web.Application:
     app.router.add_get("/addressing", addressing)
     app.router.add_get("/events", events)
     app.router.add_post("/say", say)
+
+    async def speak(req):  # proactive in-ear cue via Notice's own voice (ElevenLabs)
+        text = (await req.json()).get("text", "")
+        n.emit("notice_say", text=text)
+        asyncio.create_task(n.voice.say(text))
+        return web.json_response({"ok": True, "backend": n.voice.backend})
+
+    app.router.add_post("/speak", speak)
     app.router.add_get("/stream", stream)
     return app
 
@@ -299,6 +307,8 @@ async def amain(args):
         from .sources.neon import NeonGaze
         asyncio.create_task(NeonGaze(state, scene, ip=args.neon_ip, emit=n.emit).run())
     asyncio.create_task(memory_writer(state, memory))
+    from .voice import Voice
+    n.voice = Voice(args.voice)
 
     if not args.dry_run:
         n.apprentice = Apprentice(on_event=n.on_apprentice)
@@ -340,6 +350,7 @@ def main():
     ap.add_argument("--no-memory", action="store_true", help="don't store fixated crops")
     ap.add_argument("--tags", action="store_true", help="show AprilTags even without Neon")
     ap.add_argument("--debug", action="store_true", help="show the gaze dot")
+    ap.add_argument("--voice", default="auto", help="Notice's in-ear voice: auto (ElevenLabs if a key exists, else macOS say) | eleven | say | none")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
