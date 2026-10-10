@@ -164,7 +164,8 @@ def make_app(n: Notice) -> web.Application:
     async def gaze(_):
         g = n.state.last_gaze()
         a = n.addressing()
-        return j({"x": g.x if g else None, "y": g.y if g else None, "addressing": a["addressing"], "memory": n.memory_on})
+        return j({"x": g.x if g else None, "y": g.y if g else None, "addressing": a["addressing"],
+                  "memory": bool(n.memory and n.memory.armed)})
 
     async def layout(_):
         from .sources import markers
@@ -183,7 +184,9 @@ def make_app(n: Notice) -> web.Application:
         from . import window
         end = float(req.query.get("end", time.time()))
         start = float(req.query.get("start", end - 3.0))
-        out = await asyncio.to_thread(window.build, n.state, n.memory, start, end)
+        if req.query.get("arm") == "1":
+            n.memory.arm(True)
+        out = await asyncio.to_thread(window.build, n.state, n.memory, start, end, req.query.get("words", ""))
         n.emit("window", note=out["note"], items=out["items"], build_ms=out["build_ms"])
         return j(out)
 
@@ -202,6 +205,18 @@ def make_app(n: Notice) -> web.Application:
         return web.Response(body=jpg.tobytes(), content_type="image/jpeg",
                             headers={"X-Frame-Age-Ms": str(round((time.time() - fr[0]) * 1000))})
 
+    async def capture(req):
+        """Apprentice arms capture while the user is on a call (on=1, renewed each turn) and disarms at hang-up."""
+        n.memory.arm(req.query.get("on") == "1")
+        n.memory_on = n.memory.armed
+        n.emit("capture", on=n.memory.armed)
+        return j({"armed": n.memory.armed, "stats": n.memory.stats})
+
+    async def forget(_):
+        k = await asyncio.to_thread(n.memory.forget)
+        n.emit("forget", removed=k)
+        return j({"removed": k})
+
     async def recall(req):
         if not n.memory:
             return j([])
@@ -216,6 +231,9 @@ def make_app(n: Notice) -> web.Application:
         return web.FileResponse(p)
 
     app.router.add_get("/crop", crop)
+    app.router.add_post("/capture", capture)
+    app.router.add_get("/capture", capture)
+    app.router.add_post("/forget", forget)
     app.router.add_get("/window", window_)
     app.router.add_get("/frame", frame)
     app.router.add_get("/recall", recall)
@@ -233,13 +251,19 @@ def make_app(n: Notice) -> web.Application:
 
 
 async def memory_writer(state: AttentionState, memory):
-    """Store every world fixation that reaches 300 ms (crop + async caption)."""
+    """While armed, store world fixations that reach 500 ms (crop + on-device OCR). Prune hourly."""
     done: set[int] = set()
+    last_prune = time.time()
     while True:
         await asyncio.sleep(0.2)
+        if time.time() - last_prune > 3600:
+            last_prune = time.time()
+            await asyncio.to_thread(memory.prune)
+        if not memory.armed:
+            continue
         with state.lock:
             recent = [f for f in list(state.fixations)[-10:] if id(f) not in done and f.scene_x is not None
-                      and f.x is None and f.duration >= 0.3]
+                      and f.x is None and f.duration >= 0.5]
         for f in recent:
             done.add(id(f))
             await asyncio.to_thread(memory.on_fixation, f)
@@ -253,7 +277,7 @@ async def amain(args):
 
     state = AttentionState()
     scene = SceneBuffer()
-    memory = AttentionMemory(scene, enabled=not args.no_memory)
+    memory = AttentionMemory(scene, enabled=not args.no_memory, always_armed=args.capture_always)
     n = Notice(state, dry_run=args.dry_run, scene=scene, memory=memory)
     n.memory_on = memory.enabled
     src = args.gaze
@@ -312,6 +336,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="resolve but don't send to Apprentice")
     ap.add_argument("--no-overlay", action="store_true")
     ap.add_argument("--scene", help="mouse-world: image/video file as the scene camera instead of the webcam")
+    ap.add_argument("--capture-always", action="store_true", help="dev: save crops without a call arming it")
     ap.add_argument("--no-memory", action="store_true", help="don't store fixated crops")
     ap.add_argument("--tags", action="store_true", help="show AprilTags even without Neon")
     ap.add_argument("--debug", action="store_true", help="show the gaze dot")

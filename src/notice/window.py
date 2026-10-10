@@ -52,9 +52,14 @@ def targets(state: AttentionState, start: float, end: float) -> list[Fixation]:
     return keep
 
 
-def build(state: AttentionState, memory, start: float, end: float, caption_wait_s: float = 1.2) -> dict:
+VISUAL = {"colour", "color", "look", "looks", "picture", "photo", "image", "shape", "wearing", "logo",
+          "design", "style", "bottle", "brand", "see", "pretty", "ugly", "size"}
+THIN_TEXT = 15  # fewer characters than this = the picture is what matters
+
+
+def build(state: AttentionState, memory, start: float, end: float, words: str = "") -> dict:
     t0 = time.time()
-    items = []
+    items, seen_rows = [], set()
     for f in targets(state, start, end):
         it = {"t": round(f.start - start, 2), "dwell_ms": round(f.duration * 1000)}
         if f.x is not None:
@@ -62,10 +67,15 @@ def build(state: AttentionState, memory, start: float, end: float, caption_wait_
             it.update(kind="screen", x=round(f.x), y=round(f.y), elements=[
                 {"role": e["role"].replace("AX", ""), "label": e["label"][:80], "app": e["app"], "center": e["center"]} for e in c])
         elif memory is not None and f.scene_x is not None:
-            f2 = Fixation(f.start, max(f.end, f.start + 0.3), None, None, f.scene_x, f.scene_y)  # store even if short
-            rid = memory.on_fixation(f2)
-            row = memory.get(rid, wait_s=caption_wait_s) if rid else None
-            it.update(kind="world", caption=(row or {}).get("caption", ""), image=(row or {}).get("crop"))
+            rid = memory.on_fixation(f, force=True)  # the user spoke about it: keep it even if short
+            row = memory.get(rid) if rid else None
+            if row is None or row["id"] in seen_rows:
+                continue  # not armed, a face, or the same thing already listed
+            seen_rows.add(row["id"])
+            text = row.get("caption") or ""
+            visual = bool(VISUAL & {w.strip(".,?!").lower() for w in words.split()})
+            it.update(kind="world", caption=text,
+                      image=row["crop"] if (len(text) < THIN_TEXT or visual) else None)
         else:
             continue
         items.append(it)
@@ -82,7 +92,8 @@ def note(items: list[dict]) -> str:
             what = f'{e["role"]} "{e["label"]}" in {e["app"]} at {tuple(e["center"])}' if e else f'screen point ({it["x"]},{it["y"]})'
             parts.append(f"{i}) on the Mac screen: {what}")
         else:
-            cap = it["caption"] or "(not captioned yet; open the image)"
-            parts.append(f"{i}) in the room: {cap} [image: {it['image']}]")
+            txt = f'something with the text "{it["caption"]}"' if it["caption"] else "something with no readable text"
+            img = f" [picture: {it['image']}]" if it.get("image") else ""
+            parts.append(f"{i}) in the room: {txt}{img}")
     return ("[Glasses: while speaking the user looked at, in order (" + str(len(items)) +
             "); 'this/that/there' refer to these] " + " · ".join(parts))
