@@ -47,7 +47,10 @@ def analyze(bgr: np.ndarray) -> dict:
     labels = [str(o.identifier()).replace("_", " ") for o in (label_req.results() or [])
               if o.confidence() >= 0.35 and o.identifier() not in _GENERIC][:3]
     face = max((f.boundingBox().size.width * f.boundingBox().size.height for f in face_req.results() or []), default=0.0)
-    return {"text": " ".join(l[2] for l in lines), "codes": codes, "labels": labels, "face": float(face)}
+    text = " ".join(l[2] for l in lines)
+    if sum(ch.isalnum() for ch in text) < 3:  # OCR noise like "*" or "|"
+        text = ""
+    return {"text": text, "codes": codes, "labels": labels, "face": float(face)}
 
 
 def codes(bgr: np.ndarray) -> list[str]:

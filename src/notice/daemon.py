@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -326,6 +327,9 @@ async def amain(args):
                 await asyncio.sleep(0.1)
             world = cam.size
         MouseGaze(state, recorder=GazeRecorder(args.record) if args.record else None, world_size=world).start()
+    elif src.startswith("neon-replay:"):  # a real Neon recording (Native Recording Data), time-shifted to now
+        from .sources.neon_replay import NeonReplay
+        n.neon_replay = NeonReplay(state, scene, os.path.expanduser(src.split(":", 1)[1])).start()
     elif src.startswith("session:"):
         from .recorder import SessionReplay
         SessionReplay(state, scene, src.split(":", 1)[1]).start()

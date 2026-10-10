@@ -81,7 +81,8 @@ def build(state: AttentionState, memory, start: float, end: float, words: str = 
             seen_rows.add(row["id"])
             text = row.get("caption") or ""
             visual = bool(VISUAL & {w.strip(".,?!").lower() for w in words.split()})
-            thin = len(text) < THIN_TEXT and not row.get("codes") and not row.get("labels")
+            # labels alone ("land, road") are too vague to act on: offer the picture unless there's real text or a code
+            thin = len(text) < THIN_TEXT and not row.get("codes")
             it.update(kind="world", caption=text, codes=row.get("codes") or "", labels=row.get("labels") or "",
                       image=row["crop"] if (thin or visual) else None)
         else:
