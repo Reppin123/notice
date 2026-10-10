@@ -1,0 +1,128 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Notice overlay</title>
+<style>
+  :root { --ink:#fff; --bg:rgba(20,20,24,.86); --accent:#7cf2c3; --warn:#ffb86b; --mute:rgba(255,255,255,.55); }
+  html,body { margin:0; height:100%; background:transparent; overflow:hidden;
+    font:600 15px/1.3 -apple-system, system-ui, sans-serif; color:var(--ink); }
+  .tag { position:absolute; background:#fff; image-rendering:pixelated; display:none; }
+  body.tags .tag { display:block; }
+  #dot { position:absolute; width:14px; height:14px; margin:-7px 0 0 -7px; border-radius:50%;
+    border:2px solid var(--accent); opacity:.0; transition:opacity .2s; pointer-events:none; }
+  body.debug #dot { opacity:.8; }
+  #ring { position:absolute; width:90px; height:90px; margin:-45px 0 0 -45px; border-radius:50%;
+    border:2px dashed var(--accent); opacity:0; transition:opacity .25s; }
+  .bubble { position:absolute; left:0; top:0; max-width:340px; padding:8px 12px; border-radius:14px;
+    background:var(--bg); box-shadow:0 6px 24px rgba(0,0,0,.35); backdrop-filter:blur(8px);
+    transition:transform .38s cubic-bezier(.2,.9,.25,1.15), opacity .3s; opacity:0; white-space:pre-wrap; }
+  .bubble .k { color:var(--accent); font-size:12px; letter-spacing:.04em; text-transform:uppercase; display:block; margin-bottom:2px; }
+  .box { position:absolute; border:3px solid var(--accent); border-radius:8px; opacity:0; transition:all .3s;
+    box-shadow:0 0 0 4px rgba(124,242,195,.18); }
+  #pill { position:absolute; left:50%; top:8px; transform:translateX(-50%); padding:4px 12px; border-radius:99px;
+    background:var(--bg); font-size:13px; display:flex; gap:8px; align-items:center; }
+  #pill i { width:9px; height:9px; border-radius:50%; background:var(--mute); display:inline-block; }
+  #pill.on i { background:var(--accent); box-shadow:0 0 8px var(--accent); }
+  #pill .mem { color:var(--warn); display:none; } body.memory #pill .mem { display:inline; }
+  #caption { position:absolute; left:50%; bottom:28px; transform:translateX(-50%); padding:8px 16px; border-radius:12px;
+    background:var(--bg); font-size:20px; opacity:0; transition:opacity .3s; max-width:70vw; text-align:center; }
+  #caption s { color:var(--mute); }
+</style></head>
+<body>
+<div id="dot"></div><div id="ring"></div>
+<div id="pill"><i></i><span id="pilltext">Notice</span><span class="mem">● memory on</span></div>
+<div id="caption"></div>
+<script>
+const API = location.origin;
+const q = new URLSearchParams(location.search);
+if (q.get('tags') !== '0') document.body.classList.add('tags');
+if (q.get('debug')) document.body.classList.add('debug');
+const $ = id => document.getElementById(id);
+
+// AprilTags at the screen corners (layout comes from the daemon so it matches the mapper)
+fetch(API + '/layout').then(r => r.json()).then(L => {
+  for (const [id, [x, y]] of Object.entries(L.origins)) {
+    const img = new Image(); img.className = 'tag'; img.src = `${API}/tag/${id}.png`;
+    const pad = L.size / 8;
+    Object.assign(img.style, { left: (x - pad) + 'px', top: (y - pad) + 'px', width: (L.size + 2 * pad) + 'px' });
+    document.body.appendChild(img);
+  }
+});
+
+// live gaze + addressing
+async function tick() {
+  try {
+    const g = await (await fetch(API + '/gaze')).json();
+    if (g.x != null) { $('dot').style.left = g.x + 'px'; $('dot').style.top = g.y + 'px'; }
+    $('pill').classList.toggle('on', g.addressing);
+    $('pilltext').textContent = g.addressing ? 'listening' : 'not listening';
+    document.body.classList.toggle('memory', !!g.memory);
+  } catch (e) {}
+  setTimeout(tick, 50);
+}
+tick();
+
+const bubbles = [];
+function bubble(x, y, kind, text, ms = 3500) {
+  const b = document.createElement('div'); b.className = 'bubble';
+  b.innerHTML = `<span class="k"></span><span class="t"></span>`;
+  b.querySelector('.k').textContent = kind; b.querySelector('.t').textContent = text;
+  document.body.appendChild(b);
+  // start near the gaze dot, fly to the target
+  const sx = parseFloat($('dot').style.left) || x, sy = parseFloat($('dot').style.top) || y;
+  b.style.transform = `translate(${sx}px, ${sy}px) scale(.6)`;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const W = innerWidth, bx = Math.min(x + 18, W - 360), by = Math.max(y - 54, 34);
+    b.style.opacity = 1; b.style.transform = `translate(${bx}px, ${by}px) scale(1)`;
+  }));
+  setTimeout(() => { b.style.opacity = 0; setTimeout(() => b.remove(), 400); }, ms);
+  return b;
+}
+function box(frame, ms = 2500) {
+  const d = document.createElement('div'); d.className = 'box';
+  const [x, y, w, h] = frame;
+  Object.assign(d.style, { left: x - 4 + 'px', top: y - 4 + 'px', width: w + 'px', height: h + 'px' });
+  document.body.appendChild(d);
+  requestAnimationFrame(() => d.style.opacity = 1);
+  setTimeout(() => { d.style.opacity = 0; setTimeout(() => d.remove(), 400); }, ms);
+}
+let capTimer;
+function caption(html, ms = 4000) {
+  $('caption').innerHTML = html; $('caption').style.opacity = 1;
+  clearTimeout(capTimer); capTimer = setTimeout(() => $('caption').style.opacity = 0, ms);
+}
+const esc = s => (s || '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+function connect() {
+  const ws = new WebSocket(API.replace('http', 'ws') + '/stream');
+  ws.onmessage = m => {
+    const e = JSON.parse(m.data);
+    if (e.type === 'pointing') {
+      Object.assign($('ring').style, { left: e.x + 'px', top: e.y + 'px', opacity: .9 });
+      setTimeout(() => $('ring').style.opacity = 0, 900);
+    } else if (e.type === 'partial') {
+      caption(esc(e.text), 2500);
+    } else if (e.type === 'resolved') {
+      const f = e.fixation, c = e.top;
+      if (c) { box(c.frame); bubble(c.center[0], c.frame[1], `“${e.word}”`, c.label || c.role.replace('AX', '')); }
+      else if (f && f.x != null) bubble(f.x, f.y, `“${e.word}”`, 'here');
+      else bubble(innerWidth / 2, 80, `“${e.word}”`, 'looking away: using what you saw');
+    } else if (e.type === 'ask') {
+      caption(esc(e.text));
+    } else if (e.type === 'trimmed') {
+      caption(`<s>…</s> ${esc(e.text)}`);
+    } else if (e.type === 'ignored') {
+      caption(`<s>${esc(e.text)}</s> &nbsp;· not for me`, 2500);
+    } else if (e.type === 'agent_say' && e.text) {
+      caption(esc(e.text), 6000);
+    } else if (e.type === 'agent_point' && e.x != null) {
+      bubble(e.x, e.y, 'Apprentice', e.instruction || '', 4000);
+    } else if (e.type === 'offer') {
+      const b = bubble(e.x, e.y, e.kind || 'help', e.text, e.ms || 8000); b.classList.add('offer');
+    } else if (e.type === 'recall' && e.hits) {
+      caption(esc(e.answer || ''), 8000);
+    }
+  };
+  ws.onclose = () => setTimeout(connect, 1000);
+}
+connect();
+</script>
+</body></html>
