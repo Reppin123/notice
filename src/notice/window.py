@@ -5,10 +5,14 @@ three distinct targets in time order; the model matches them to "this" / "there"
 """
 from __future__ import annotations
 
+import difflib
 import time
+
+import cv2
 
 from . import screen
 from .core import AttentionState, Fixation
+from .scene import colour_hist, same_colours
 
 LEAD_S, TAIL_S = 1.0, 0.3
 MIN_S = 0.15
@@ -48,8 +52,8 @@ def targets(state: AttentionState, start: float, end: float) -> list[Fixation]:
             p.end = max(p.end, f.end)
         else:
             merged.append(Fixation(f.start, f.end, f.x, f.y, f.scene_x, f.scene_y, f.source))
-    # keep the 3 longest, in time order
-    keep = sorted(sorted(merged, key=lambda f: -f.duration)[:3], key=lambda f: f.start)
+    # keep the 5 longest, in time order (build() merges looks at one object, then caps at 3)
+    keep = sorted(sorted(merged, key=lambda f: -f.duration)[:5], key=lambda f: f.start)
     return keep
 
 
@@ -79,16 +83,75 @@ def build(state: AttentionState, memory, start: float, end: float, words: str = 
             if row is None or row["id"] in seen_rows:
                 continue  # not armed, a face, or the same thing already listed
             seen_rows.add(row["id"])
-            text = row.get("caption") or ""
-            visual = bool(VISUAL & {w.strip(".,?!").lower() for w in words.split()})
-            # labels alone ("land, road") are too vague to act on: offer the picture unless there's real text or a code
-            thin = len(text) < THIN_TEXT and not row.get("codes")
-            it.update(kind="world", caption=text, codes=row.get("codes") or "", labels=row.get("labels") or "",
-                      image=row["crop"] if (thin or visual) else None)
+            it.update(kind="world", rows=[row])
         else:
             continue
         items.append(it)
+    visual = bool(VISUAL & {w.strip(".,?!").lower() for w in words.split()})
+    items = _merge_same_object(items)
+    items = sorted(sorted(items, key=lambda i: -i["dwell_ms"])[:3], key=lambda i: i["t"])
+    items = [_finish(it, visual) if it["kind"] == "world" else it for it in items]
     return {"items": items, "note": note(items), "build_ms": round((time.time() - t0) * 1000)}
+
+
+SAME_COLOURS = 0.5     # real Neon crops of one held bag: 0.52-0.94; vs most of the room <= 0.26
+SAME_COLOURS_NO_TEXT = 0.8  # without text to confirm, colours alone mislead: phone on a wood desk next to
+                            # the bag scored 0.62 against it
+TEXT_AGREES = 0.35     # garbled reads of one logo: >= 0.38. Unrelated labels usually score lower, but ones sharing
+                       # a word can reach 0.5 ("Trader Joes milk" / "Oat Milk"); colours must also match then
+
+
+def _norm(t: str) -> str:
+    return "".join(c for c in t.lower() if c.isalnum() or c == " ").strip()
+
+
+def _same_object(a: dict, b: dict) -> bool:
+    ha, hb = _hist(a), _hist(b)
+    if ha is None or hb is None:
+        return False
+    colours = same_colours(ha, hb)
+    ta, tb = _norm(a.get("caption") or ""), _norm(b.get("caption") or "")
+    if ta and tb:
+        return colours >= SAME_COLOURS and difflib.SequenceMatcher(None, ta, tb).ratio() >= TEXT_AGREES
+    return colours >= SAME_COLOURS_NO_TEXT
+
+
+def _merge_same_object(items: list[dict]) -> list[dict]:
+    """Back-to-back looks at one object (eyes wander over a bag you hold up) become ONE item.
+    Scene position can't decide this (the object and head move); colours + not-clashing text can."""
+    out: list[dict] = []
+    for it in items:
+        p = out[-1] if out else None
+        if p and p["kind"] == it["kind"] == "world":
+            if _same_object(p["rows"][-1], it["rows"][0]):
+                p["rows"] += it["rows"]
+                p["dwell_ms"] += it["dwell_ms"]
+                continue
+        out.append(it)
+    return out
+
+
+def _hist(row: dict):
+    if "_hist" not in row:
+        img = cv2.imread(row["crop"]) if row.get("crop") else None
+        row["_hist"] = colour_hist(img) if img is not None else None
+    return row["_hist"]
+
+
+def _finish(it: dict, visual: bool) -> dict:
+    """Keep the reading OCR was surest of; send the picture when the text is thin, the words are about
+    looks, or the reads disagree (a stylised logo: let the model read it)."""
+    rows = it.pop("rows")
+    best = max(rows, key=lambda r: (r.get("conf") or 0, len(r.get("caption") or "")))
+    text = best.get("caption") or ""
+    reads = {_norm(r.get("caption") or "") for r in rows if r.get("caption")}
+    disagree = len(reads) > 1
+    codes = " ".join(dict.fromkeys(c for r in rows for c in (r.get("codes") or "").split()))
+    labels = best.get("labels") or next((r["labels"] for r in rows if r.get("labels")), "")
+    thin = len(text) < THIN_TEXT and not codes
+    it.update(caption=text, codes=codes, labels=labels, looks=len(rows),
+              image=best["crop"] if (thin or visual or disagree) else None)
+    return it
 
 
 def note(items: list[dict]) -> str:

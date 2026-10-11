@@ -12,6 +12,7 @@ import time
 
 from pupil_labs.realtime_api import Device
 from pupil_labs.realtime_api.discovery import discover_devices
+from pupil_labs.realtime_api.time_echo import TimeOffsetEstimator
 from pupil_labs.realtime_api.streaming.eye_events import BlinkEventData, FixationEventData, receive_eye_events_data
 from pupil_labs.realtime_api.streaming.gaze import receive_gaze_data
 from pupil_labs.realtime_api.streaming.video import receive_video_frames
@@ -24,10 +25,14 @@ log = logging.getLogger("notice.neon")
 
 
 class NeonGaze:
-    def __init__(self, state: AttentionState, scene, ip: str | None = None, emit=None, scene_hz: float = 15):
+    def __init__(self, state: AttentionState, scene, ip: str | None = None, emit=None, scene_hz: float = 10,
+                 map_screen: bool = True):
         self.state, self.scene, self.ip, self.emit = state, scene, ip, emit or (lambda *a, **k: None)
         self.offset_s = 0.0
         self.scene_period = 1.0 / scene_hz
+        self.map_screen = map_screen  # AprilTag search on every frame: only when the screen tags are shown
+        self._newest = None  # newest undecoded scene frame; the worker only ever processes this one
+        self._new_frame = asyncio.Event()
         self.mapper: GazeMapper | None = None
         self.surface = None
         self.screen_seen_at = 0.0  # last time the tags were located
@@ -44,8 +49,14 @@ class NeonGaze:
         raise RuntimeError("no Neon found (mDNS); pass --neon-ip")
 
     async def _offset_loop(self, device: Device):
+        status = await device.get_status()
+        port = status.phone.time_echo_port
+        if port is None:
+            self.emit("neon_clock", error="Companion app too old for Time Echo; offset stays 0")
+            return
+        estimator = TimeOffsetEstimator(status.phone.ip, port)
         while True:
-            est = await device.estimate_time_offset()
+            est = await estimator.estimate(number_of_measurements=50)
             if est:
                 self.offset_s = est.time_offset_ms.mean / 1000
                 self.status.update(offset_ms=round(est.time_offset_ms.mean, 1),
@@ -104,6 +115,7 @@ class NeonGaze:
             tasks = [asyncio.create_task(c) for c in (
                 self._offset_loop(device),
                 self._scene(status.direct_world_sensor().url),
+                self._scene_worker(),
                 self._gaze(status.direct_gaze_sensor().url),
                 self._events(status.direct_eye_events_sensor().url),
                 self._stall_watch())]
@@ -117,23 +129,30 @@ class NeonGaze:
                     t.cancel()
 
     async def _scene(self, url):
-        last = 0.0
+        """Reader: keep only the newest frame. Never await processing here, or unread video piles up
+        and every crop shows the past (on real hardware frames fell 3.7 s behind)."""
         async for frame in receive_video_frames(url, run_loop=True):
-            now = time.time()
-            if now - last < self.scene_period:
-                continue
-            last = now
-            bgr = frame.bgr_buffer()
-            t = frame.timestamp_unix_seconds + self.offset_s
-            await asyncio.to_thread(self._process, t, bgr)
-            loc = self.mapper._surface_locations.get(self.surface.uid)
-            if loc is not None:
-                self.screen_seen_at = now
-            self.stats["frames"] += 1
+            self._newest = frame
+            self._new_frame.set()
 
-    def _process(self, t, bgr):
+    async def _scene_worker(self):
+        """Process the newest frame at most scene_hz times a second; older frames are dropped."""
+        while True:
+            await self._new_frame.wait()
+            self._new_frame.clear()
+            frame, started = self._newest, time.time()
+            t = frame.timestamp_unix_seconds + self.offset_s
+            await asyncio.to_thread(self._process, t, frame)
+            if self.map_screen and self.mapper._surface_locations.get(self.surface.uid) is not None:
+                self.screen_seen_at = time.time()
+            self.stats["frames"] += 1
+            await asyncio.sleep(max(0.0, self.scene_period - (time.time() - started)))
+
+    def _process(self, t, frame):
+        bgr = frame.bgr_buffer()
         self.scene.add(t, bgr)
-        self.mapper.process_scene(bgr)
+        if self.map_screen:
+            self.mapper.process_scene(bgr)
 
     async def _gaze(self, url):
         async for g in receive_gaze_data(url, run_loop=True):

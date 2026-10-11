@@ -45,6 +45,8 @@ class AttentionMemory:
         self.db.execute("""create table if not exists seen(
             id integer primary key, t real, dwell_ms int, scene_x real, scene_y real,
             crop text, hash text, caption text, codes text default '', labels text default '')""")
+        if "conf" not in {r[1] for r in self.db.execute("pragma table_info(seen)")}:
+            self.db.execute("alter table seen add column conf real default 0")
         self.db.execute("create virtual table if not exists seen_fts using fts5(caption, content='seen', content_rowid='id')")
         self.lock = threading.Lock()
         self.recent: list[tuple[float, int, int, float]] = []  # (t, hash, row id, fixation start)
@@ -114,9 +116,9 @@ class AttentionMemory:
         path = DATA / "crops" / f"{int(now * 1000)}.jpg"
         cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
         with self.lock:
-            cur = self.db.execute("insert into seen(t, dwell_ms, scene_x, scene_y, crop, hash, caption, codes, labels) "
-                                  "values(?,?,?,?,?,?,?,?,?)",
-                                  (f.start, dwell, f.scene_x, f.scene_y, str(path), str(h), text, codes, labels))
+            cur = self.db.execute("insert into seen(t, dwell_ms, scene_x, scene_y, crop, hash, caption, codes, labels, conf) "
+                                  "values(?,?,?,?,?,?,?,?,?,?)",
+                                  (f.start, dwell, f.scene_x, f.scene_y, str(path), str(h), text, codes, labels, a["conf"]))
             rid = cur.lastrowid
             searchable = " ".join(x for x in (text, labels, codes) if x)
             if searchable:
@@ -155,8 +157,8 @@ class AttentionMemory:
     # ---- read --------------------------------------------------------------------------
     def get(self, rid: int, wait_s: float = 0.0) -> dict | None:
         with self.lock:
-            row = self.db.execute("select id, t, dwell_ms, crop, caption, codes, labels from seen where id = ?", (rid,)).fetchone()
-        return dict(zip(("id", "t", "dwell_ms", "crop", "caption", "codes", "labels"), row)) if row else None
+            row = self.db.execute("select id, t, dwell_ms, crop, caption, codes, labels, conf from seen where id = ?", (rid,)).fetchone()
+        return dict(zip(("id", "t", "dwell_ms", "crop", "caption", "codes", "labels", "conf"), row)) if row else None
 
     def recall(self, query: str = "", since: float | None = None, limit: int = 5) -> list[dict]:
         since = since or 0

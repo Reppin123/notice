@@ -14,14 +14,18 @@ _GENERIC = {"structure", "material", "indoor", "outdoor", "wood_processed", "doc
 
 
 def _cgimage(bgr: np.ndarray):
-    ok, png = cv2.imencode(".png", bgr)
-    data = NSData.dataWithBytes_length_(png.tobytes(), len(png))
-    src = Quartz.CGImageSourceCreateWithData(data, None)
-    return Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
+    """Raw RGBA straight into a CGImage (~2 ms; a PNG round-trip was 50-60 ms)."""
+    rgba = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA))
+    h, w = rgba.shape[:2]
+    provider = Quartz.CGDataProviderCreateWithCFData(NSData.dataWithBytes_length_(rgba.tobytes(), rgba.nbytes))
+    return Quartz.CGImageCreate(w, h, 8, 32, w * 4, Quartz.CGColorSpaceCreateDeviceRGB(),
+                                Quartz.kCGImageAlphaNoneSkipLast, provider, None, False,
+                                Quartz.kCGRenderingIntentDefault)
 
 
 def analyze(bgr: np.ndarray) -> dict:
-    """{'text', 'codes', 'labels', 'face'}; text top-to-bottom, face = largest face area fraction."""
+    """{'text', 'conf', 'codes', 'labels', 'face'}; text top-to-bottom, conf = mean OCR confidence,
+    face = largest face area fraction."""
     img = _cgimage(bgr)
     handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(img, {})
     text_req = Vision.VNRecognizeTextRequest.alloc().init()
@@ -37,7 +41,7 @@ def analyze(bgr: np.ndarray) -> dict:
         cand = obs.topCandidates_(1)
         if cand and cand[0].confidence() >= 0.3:
             box = obs.boundingBox()  # normalized, origin bottom-left
-            lines.append((-(box.origin.y + box.size.height), box.origin.x, cand[0].string()))
+            lines.append((-(box.origin.y + box.size.height), box.origin.x, cand[0].string(), cand[0].confidence()))
     lines.sort()
     codes = []
     for c in code_req.results() or []:
@@ -48,9 +52,10 @@ def analyze(bgr: np.ndarray) -> dict:
               if o.confidence() >= 0.35 and o.identifier() not in _GENERIC][:3]
     face = max((f.boundingBox().size.width * f.boundingBox().size.height for f in face_req.results() or []), default=0.0)
     text = " ".join(l[2] for l in lines)
+    conf = sum(l[3] for l in lines) / len(lines) if lines else 0.0
     if sum(ch.isalnum() for ch in text) < 3:  # OCR noise like "*" or "|"
-        text = ""
-    return {"text": text, "codes": codes, "labels": labels, "face": float(face)}
+        text, conf = "", 0.0
+    return {"text": text, "conf": float(conf), "codes": codes, "labels": labels, "face": float(face)}
 
 
 def codes(bgr: np.ndarray) -> list[str]:

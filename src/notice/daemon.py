@@ -338,7 +338,7 @@ async def amain(args):
         ReplayGaze(state, src.split(":", 1)[1], loop=True).start()
     elif src == "neon":
         from .sources.neon import NeonGaze
-        n.neon = NeonGaze(state, scene, ip=args.neon_ip, emit=n.emit)
+        n.neon = NeonGaze(state, scene, ip=args.neon_ip, emit=n.emit, map_screen=not args.no_overlay)
         asyncio.create_task(n.neon.run())
     asyncio.create_task(memory_writer(state, memory))
     if args.record_sessions:
