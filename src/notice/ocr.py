@@ -106,3 +106,17 @@ def blur_faces(bgr: np.ndarray, faces=None) -> int:
             k = max(15, (max(roi.shape[:2]) // 2) | 1)
             bgr[y0:y1, x0:x1] = cv2.GaussianBlur(roi, (k, k), 0)
     return len(faces)
+
+
+def regions(bgr: np.ndarray) -> dict:
+    """Where things are, for snapping a zoom: text lines and distinct objects, normalized top-left
+    boxes. Fast requests only (text rectangles, objectness saliency), ~50-100 ms on a full frame."""
+    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(_cgimage(bgr), {})
+    text_req = Vision.VNDetectTextRectanglesRequest.alloc().init()
+    obj_req = Vision.VNGenerateObjectnessBasedSaliencyImageRequest.alloc().init()
+    handler.performRequests_error_([text_req, obj_req], None)
+    text = [_box(o) for o in text_req.results() or []]
+    objects = []
+    for res in obj_req.results() or []:
+        objects += [_box(o) for o in (res.salientObjects() or [])]
+    return {"text": text, "objects": objects}

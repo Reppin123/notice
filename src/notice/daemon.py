@@ -197,52 +197,83 @@ def make_app(n: Notice) -> web.Application:
             fr = n.scene.nearest(it["tm"]) if n.scene and it.get("tm") else None
             snaps.append((fr[1], it["sx"], it["sy"], it["tm"]) if fr and it.get("sx") is not None else None)
         n.snapshots = snaps
+        # and 4 frames across the utterance for "what just happened" (the 10 s ring is gone by then)
+        motion = []
+        if n.scene:
+            with n.state.lock:
+                gz = [g for g in n.state.gaze if start - 0.5 <= g.t <= end + 0.5 and g.sx is not None]
+            for k in range(4):
+                tk = start + (end - start) * k / 3
+                fr = n.scene.nearest(tk)
+                g = min(gz, key=lambda g: abs(g.t - tk)) if gz else None
+                if fr and g and (not motion or fr[0] != motion[-1][3]):
+                    motion.append((fr[1], g.sx, g.sy, fr[0]))
+        n.motion = motion
         n.emit("window", note=out["note"], items=out["items"], build_ms=out["build_ms"])
         return j(out)
 
     async def snapshot(req):
-        """What the user looked at, as two JPEGs side by side in a JSON: a full-resolution close-up around
-        the gaze (small print stays readable) and the whole view with a gaze circle. Faces blurred.
-        when=spoken (default): item N (1-based) from the last utterance. when=now: the live frame."""
+        """ONE image of what the user looked at (see snapshot.py), faces blurred, as base64 JPEG in JSON.
+        when=spoken (default): the last utterance's frozen frames; item=N = thing N of the note.
+        when=now: the live frame. view=auto (default: sheet if several things, else whole) | whole |
+        sheet | motion | zoom (+ area=x,y,w,h fractions of the whole view; omitted = snap near gaze)."""
         import base64
-        from .scene import crop_around, decode, mark_gaze
-        from . import ocr
+        from .scene import decode
+        from . import ocr, snapshot as snap
         import cv2
-        if req.query.get("when") == "now":
+        when, view = req.query.get("when", "spoken"), req.query.get("view", "auto")
+        item, area = int(req.query.get("item", 0) or 0), req.query.get("area") or None
+        if when == "now":
             fr = n.scene.latest() if n.scene else None
             g = next((g for g in reversed(n.state.gaze) if g.sx is not None), None)
             if fr is None or g is None or time.time() - fr[0] > 1.5:
                 return web.Response(status=404, text="glasses not streaming")
-            jpg, sx, sy, t = fr[1], g.sx, g.sy, fr[0]
+            picks, view = [(fr[1], g.sx, g.sy, fr[0])], ("zoom" if view == "zoom" else "whole")
+        elif view == "motion":
+            picks = list(getattr(n, "motion", []))
         else:
-            snaps = getattr(n, "snapshots", [])
-            i = int(req.query.get("item", 0) or 0)
-            if not snaps or not any(snaps):
+            snaps = [s_ for s_ in getattr(n, "snapshots", [])]
+            if not any(snaps):
                 return web.Response(status=404, text="nothing looked at in the last utterance")
-            pick = snaps[i - 1] if 1 <= i <= len(snaps) else max(
-                (s for s in snaps if s), key=lambda s: s[3])  # default: the last thing looked at
-            if pick is None:
-                return web.Response(status=404, text=f"item {i} has no frame")
-            jpg, sx, sy, t = pick
+            if 1 <= item <= len(snaps):
+                if snaps[item - 1] is None:
+                    return web.Response(status=404, text=f"item {item} has no frame")
+                picks = [snaps[item - 1]]
+            elif view in ("sheet", "auto") and sum(1 for s_ in snaps if s_) > 1:
+                picks, view = snaps, "sheet"
+            else:
+                picks = [max((s_ for s_ in snaps if s_), key=lambda s_: s_[3])]  # the last thing looked at
+            if view == "auto":
+                view = "whole"
+        if not picks:
+            return web.Response(status=404, text="no frames")
 
         def render():
-            img = decode(jpg)
-            faces = ocr.blur_faces(img)
-            close = crop_around(img, sx, sy, size=int(req.query.get("zoom", 640)))
-            # gaze sits at the crop centre unless the crop was clamped at a frame edge: mark the real spot
-            h, w = img.shape[:2]
-            half = close.shape[0] // 2
-            cx = int(sx - min(max(sx - half, 0), max(w - close.shape[1], 0)))
-            cy = int(sy - min(max(sy - half, 0), max(h - close.shape[0], 0)))
-            cv2.circle(close, (cx, cy), 22, (0, 0, 255), 2)
-            view = req.query.get("view", "both")
-            enc = lambda im: base64.b64encode(cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()).decode()
-            out = {"age_s": round(time.time() - t, 1), "faces_blurred": faces}
-            if view in ("close", "both"):
-                out["close"] = enc(close)
-            if view in ("whole", "both"):
-                out["whole"] = enc(mark_gaze(img, sx, sy, max_w=800))
-            return out
+            meta = {"view": view, "age_s": round(time.time() - max(p[3] for p in picks if p), 1)}
+            faces = 0
+            if view in ("sheet", "motion"):
+                frames = []
+                for i, p in enumerate(picks, 1):
+                    if p is None:
+                        continue
+                    img = decode(p[0])
+                    faces += ocr.blur_faces(img)
+                    frames.append((img, p[1], p[2], str(i)))
+                out = snap.sheet(frames)
+                meta["tiles"] = len(frames)
+            else:
+                jpg, sx, sy, _ = picks[0]
+                img = decode(jpg)
+                faces += ocr.blur_faces(img)
+                if view == "zoom":
+                    out, z = snap.zoom(img, sx, sy, area)
+                    meta.update(z)
+                else:
+                    out = snap.whole(img, sx, sy)
+            meta["faces_blurred"] = faces
+            meta["image"] = base64.b64encode(cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()).decode()
+            meta["size"] = [out.shape[1], out.shape[0]]
+            return meta
         return j(await asyncio.to_thread(render))
 
     async def frame(req):
