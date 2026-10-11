@@ -114,6 +114,9 @@ class AttentionMemory:
         found = a["codes"] or ocr.codes(crop_around(full, f.scene_x, f.scene_y, size=800))
         codes, labels = " ".join(found), ", ".join(a["labels"])
         path = DATA / "crops" / f"{int(now * 1000)}.jpg"
+        if a["faces"]:
+            ocr.blur_faces(crop, a["faces"])  # small faces (people across the room) pass FACE_MAX: blur them
+            self.stats["blurred"] = self.stats.get("blurred", 0) + 1
         cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
         with self.lock:
             cur = self.db.execute("insert into seen(t, dwell_ms, scene_x, scene_y, crop, hash, caption, codes, labels, conf) "

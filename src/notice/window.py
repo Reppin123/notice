@@ -83,7 +83,7 @@ def build(state: AttentionState, memory, start: float, end: float, words: str = 
             if row is None or row["id"] in seen_rows:
                 continue  # not armed, a face, or the same thing already listed
             seen_rows.add(row["id"])
-            it.update(kind="world", rows=[row])
+            it.update(kind="world", rows=[row], sx=f.scene_x, sy=f.scene_y, tm=(f.start + f.end) / 2)
         else:
             continue
         items.append(it)
@@ -99,6 +99,15 @@ SAME_COLOURS_NO_TEXT = 0.8  # without text to confirm, colours alone mislead: ph
                             # the bag scored 0.62 against it
 TEXT_AGREES = 0.35     # garbled reads of one logo: >= 0.38. Unrelated labels usually score lower, but ones sharing
                        # a word can reach 0.5 ("Trader Joes milk" / "Oat Milk"); colours must also match then
+
+
+SURE_OCR = 0.8  # Vision line confidence: clean print reads 1.0, garbled logos 0.5-0.75
+
+
+def _junk(t: str) -> bool:
+    """Mixed scripts or mostly non-letters = a garbled read."""
+    letters = [c for c in t if c.isalpha()]
+    return bool(letters) and (sum(not c.isascii() for c in letters) / len(letters) > 0.1 or len(letters) < len(t) * 0.4)
 
 
 def _norm(t: str) -> str:
@@ -149,8 +158,11 @@ def _finish(it: dict, visual: bool) -> dict:
     codes = " ".join(dict.fromkeys(c for r in rows for c in (r.get("codes") or "").split()))
     labels = best.get("labels") or next((r["labels"] for r in rows if r.get("labels")), "")
     thin = len(text) < THIN_TEXT and not codes
-    it.update(caption=text, codes=codes, labels=labels, looks=len(rows),
-              image=best["crop"] if (thin or visual or disagree) else None)
+    unsure = (best.get("conf") or 0) < SURE_OCR or _junk(text)
+    if text and (unsure or disagree):
+        labels = ""  # Vision's labels on a held object ("machine") mislead more than help next to text
+    it.update(caption=text, codes=codes, labels=labels, looks=len(rows), unsure=bool(text) and (unsure or disagree),
+              image=best["crop"] if (thin or visual or disagree or unsure) else None)
     return it
 
 
@@ -164,12 +176,18 @@ def note(items: list[dict]) -> str:
             what = f'{e["role"]} "{e["label"]}" in {e["app"]} at {tuple(e["center"])}' if e else f'screen point ({it["x"]},{it["y"]})'
             parts.append(f"{i}) on the Mac screen: {what}")
         else:
-            txt = f'something with the text "{it["caption"]}"' if it["caption"] else "something with no readable text"
+            cap = it["caption"]
+            if cap and it.get("unsure"):
+                txt = f'something whose text OCR read unsure as "{cap}" (trust the picture over this)'
+            elif cap:
+                txt = f'something with the text "{cap}"'
+            else:
+                txt = "something with no readable text"
             if it.get("labels"):
                 txt += f' (looks like: {it["labels"]})'
             if it.get("codes"):
                 txt += f' (QR/barcode: {it["codes"]})'
-            img = f" [picture: {it['image']}]" if it.get("image") else ""
+            img = f" [see it: look_through_glasses item={i}]" if it.get("image") else ""
             parts.append(f"{i}) in the room: {txt}{img}")
     return ("[Glasses: while speaking the user looked at, in order (" + str(len(items)) +
             "); 'this/that/there' refer to these] " + " · ".join(parts))

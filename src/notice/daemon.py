@@ -190,8 +190,55 @@ def make_app(n: Notice) -> web.Application:
         if req.query.get("arm") == "1":
             n.memory.arm(True)
         out = await asyncio.to_thread(window.build, n.state, n.memory, start, end, req.query.get("words", ""))
+        # freeze the frame of each thing looked at while speaking: the agent looks at THAT moment, not
+        # whatever the user turned to while it thought (real call: "you're looking at the laptop")
+        snaps = []
+        for it in out["items"]:
+            fr = n.scene.nearest(it["tm"]) if n.scene and it.get("tm") else None
+            snaps.append((fr[1], it["sx"], it["sy"], it["tm"]) if fr and it.get("sx") is not None else None)
+        n.snapshots = snaps
         n.emit("window", note=out["note"], items=out["items"], build_ms=out["build_ms"])
         return j(out)
+
+    async def snapshot(req):
+        """What the user looked at, as two JPEGs side by side in a JSON: a full-resolution close-up around
+        the gaze (small print stays readable) and the whole view with a gaze circle. Faces blurred.
+        when=spoken (default): item N (1-based) from the last utterance. when=now: the live frame."""
+        import base64
+        from .scene import crop_around, decode, mark_gaze
+        from . import ocr
+        import cv2
+        if req.query.get("when") == "now":
+            fr = n.scene.latest() if n.scene else None
+            g = next((g for g in reversed(n.state.gaze) if g.sx is not None), None)
+            if fr is None or g is None or time.time() - fr[0] > 1.5:
+                return web.Response(status=404, text="glasses not streaming")
+            jpg, sx, sy, t = fr[1], g.sx, g.sy, fr[0]
+        else:
+            snaps = getattr(n, "snapshots", [])
+            i = int(req.query.get("item", 0) or 0)
+            if not snaps or not any(snaps):
+                return web.Response(status=404, text="nothing looked at in the last utterance")
+            pick = snaps[i - 1] if 1 <= i <= len(snaps) else max(
+                (s for s in snaps if s), key=lambda s: s[3])  # default: the last thing looked at
+            if pick is None:
+                return web.Response(status=404, text=f"item {i} has no frame")
+            jpg, sx, sy, t = pick
+
+        def render():
+            img = decode(jpg)
+            faces = ocr.blur_faces(img)
+            close = crop_around(img, sx, sy, size=int(req.query.get("zoom", 640)))
+            # gaze sits at the crop centre unless the crop was clamped at a frame edge: mark the real spot
+            h, w = img.shape[:2]
+            half = close.shape[0] // 2
+            cx = int(sx - min(max(sx - half, 0), max(w - close.shape[1], 0)))
+            cy = int(sy - min(max(sy - half, 0), max(h - close.shape[0], 0)))
+            cv2.circle(close, (cx, cy), 22, (0, 0, 255), 2)
+            whole = mark_gaze(img, sx, sy, max_w=800)
+            enc = lambda im: base64.b64encode(cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()).decode()
+            return {"close": enc(close), "whole": enc(whole), "age_s": round(time.time() - t, 1), "faces_blurred": faces}
+        return j(await asyncio.to_thread(render))
 
     async def frame(req):
         """Latest scene frame with the gaze circle (what the wearer sees right now), JPEG."""
@@ -262,6 +309,7 @@ def make_app(n: Notice) -> web.Application:
     app.router.add_post("/forget", forget)
     app.router.add_get("/window", window_)
     app.router.add_get("/frame", frame)
+    app.router.add_get("/snapshot", snapshot)
     app.router.add_get("/recall", recall)
     app.router.add_get("/", overlay)
     app.router.add_get("/gaze", gaze)
