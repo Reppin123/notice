@@ -235,9 +235,14 @@ def make_app(n: Notice) -> web.Application:
             cx = int(sx - min(max(sx - half, 0), max(w - close.shape[1], 0)))
             cy = int(sy - min(max(sy - half, 0), max(h - close.shape[0], 0)))
             cv2.circle(close, (cx, cy), 22, (0, 0, 255), 2)
-            whole = mark_gaze(img, sx, sy, max_w=800)
+            view = req.query.get("view", "both")
             enc = lambda im: base64.b64encode(cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()).decode()
-            return {"close": enc(close), "whole": enc(whole), "age_s": round(time.time() - t, 1), "faces_blurred": faces}
+            out = {"age_s": round(time.time() - t, 1), "faces_blurred": faces}
+            if view in ("close", "both"):
+                out["close"] = enc(close)
+            if view in ("whole", "both"):
+                out["whole"] = enc(mark_gaze(img, sx, sy, max_w=800))
+            return out
         return j(await asyncio.to_thread(render))
 
     async def frame(req):
